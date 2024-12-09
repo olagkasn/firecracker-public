@@ -14,6 +14,7 @@ use crate::devices::virtio::net::TapError;
 pub mod balloon;
 pub mod block;
 pub mod device;
+pub mod memory;
 pub mod gen;
 pub mod iovec;
 pub mod mmio;
@@ -54,7 +55,7 @@ pub const TYPE_BLOCK: u32 = 2;
 pub const TYPE_RNG: u32 = 4;
 /// Virtio balloon device ID.
 pub const TYPE_BALLOON: u32 = 5;
-
+pub const TYPE_MEMORY: u32 = 24;
 /// Offset from the base MMIO address of a virtio device used by the guest to notify the device of
 /// queue events.
 pub const NOTIFY_REG_OFFSET: u32 = 0x50;

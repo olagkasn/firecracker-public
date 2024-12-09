@@ -50,6 +50,7 @@ use crate::devices::legacy::serial::SerialOut;
 use crate::devices::legacy::RTCDevice;
 use crate::devices::legacy::{EventFdTrigger, SerialEventsWrapper, SerialWrapper};
 use crate::devices::virtio::balloon::Balloon;
+use crate::devices::virtio::memory::device::Memory;
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::device::VirtioDevice;
 use crate::devices::virtio::mmio::MmioTransport;
@@ -66,12 +67,17 @@ use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{VmConfig, VmConfigError};
 use crate::vstate::memory::{GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryMmap};
 use crate::vstate::vcpu::{Vcpu, VcpuConfig, VcpuError};
+use crate::vstate::vm;
 use crate::vstate::vm::Vm;
 use crate::{device_manager, EventManager, Vmm, VmmError};
+
+const GIB: u64 = 1024 * 1024 * 1024;
 
 /// Errors associated with starting the instance.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum StartMicrovmError {
+    /// Could not register additional guest memory (used by memory device) to VM.
+    AddMemoryDeviceRegion(vm::VmError),
     /// Unable to attach block device to Vmm: {0}
     AttachBlockDevice(io::Error),
     /// Unable to attach the VMGenID device: {0}
@@ -105,6 +111,8 @@ pub enum StartMicrovmError {
     KernelLoader(linux_loader::loader::Error),
     /// Cannot load command line string: {0}
     LoadCommandline(linux_loader::loader::Error),
+    /// Cannot add region for a memory device: {0}
+    MemoryDevice(crate::devices::virtio::memory::Error),
     /// Cannot start microvm without kernel configuration.
     MissingKernelConfig,
     /// Cannot start microvm without guest mem_size config.
@@ -219,6 +227,7 @@ fn create_vmm_and_vcpus(
         shutdown_exit_code: None,
         vm,
         guest_memory,
+        memory_device_guest_memory: Vec::new(),
         uffd,
         vcpus_handles: Vec::new(),
         vcpus_exit_evt,
@@ -314,6 +323,13 @@ pub fn build_microvm_for_boot(
     if let Some(balloon) = vm_resources.balloon.get() {
         attach_balloon_device(&mut vmm, &mut boot_cmdline, balloon, event_manager)?;
     }
+
+    attach_memory_devices(
+        &mut vmm,
+        &mut boot_cmdline,
+        vm_resources.memory.iter(),
+        event_manager,
+    )?;
 
     attach_block_devices(
         &mut vmm,
@@ -1003,6 +1019,40 @@ fn attach_balloon_device(
     attach_virtio_device(event_manager, vmm, id, balloon.clone(), cmdline, false)
 }
 
+fn attach_memory_devices<'a>(
+    vmm: &mut Vmm,
+    cmdline: &mut LoaderKernelCmdline,
+    memory_devices: impl Iterator<Item = &'a Arc<Mutex<Memory>>>,
+    event_manager: &mut EventManager,
+) -> std::result::Result<(), StartMicrovmError> {
+    for (index, memory) in memory_devices.enumerate() {
+        if index > 0 {
+            panic!("too many memory devices. please only use one for now!! Thx >.< !!")
+        }
+        let id = String::from(memory.lock().expect("Poisoned lock").id());
+        let size: usize = memory.lock().expect("Poisoned lock").region_size() as usize;
+        // The device mutex mustn't be locked here otherwise it will deadlock.
+        attach_virtio_device(event_manager, vmm, id, memory.clone(), cmdline, false)?;
+        // For now, when developing/testing with only one memory device, this hardcoded address
+        // should suffice.
+        let region_start_address = 32 * GIB;
+        // Creating the actual memory backend for this memory device.
+        let this_device_memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(region_start_address), size)])
+            .map_err(StartMicrovmError::GuestMemory)?;
+        // Adding the memory to the VM.
+        vmm.vm
+            .add_memory(&this_device_memory)
+            .map_err(StartMicrovmError::AddMemoryDeviceRegion)?;
+        vmm.memory_device_guest_memory = vec![this_device_memory];
+        memory
+            .lock()
+            .expect("Poisoned lock")
+            .set_addr(region_start_address)
+            .map_err(StartMicrovmError::MemoryDevice)?;
+    }
+    Ok(())
+}
+
 // Adds `O_NONBLOCK` to the stdout flags.
 pub(crate) fn set_stdout_nonblocking() {
     // SAFETY: Call is safe since parameters are valid.
@@ -1030,13 +1080,15 @@ pub mod tests {
     use crate::devices::virtio::block::CacheType;
     use crate::devices::virtio::rng::device::ENTROPY_DEV_ID;
     use crate::devices::virtio::vsock::{TYPE_VSOCK, VSOCK_DEV_ID};
-    use crate::devices::virtio::{TYPE_BALLOON, TYPE_BLOCK, TYPE_RNG};
+    use crate::devices::virtio::{TYPE_BALLOON, TYPE_BLOCK, TYPE_MEMORY, TYPE_RNG};
     use crate::mmds::data_store::{Mmds, MmdsVersion};
     use crate::mmds::ns::MmdsNetworkStack;
+    use utils::get_page_size;
     use crate::utilities::test_utils::{arch_mem, single_region_mem, single_region_mem_at};
     use crate::vmm_config::balloon::{BalloonBuilder, BalloonDeviceConfig, BALLOON_DEV_ID};
     use crate::vmm_config::boot_source::DEFAULT_KERNEL_CMDLINE;
     use crate::vmm_config::drive::{BlockBuilder, BlockDeviceConfig};
+    use crate::vmm_config::memory::{MemoryBuilder, MemoryDeviceConfig};
     use crate::vmm_config::entropy::{EntropyDeviceBuilder, EntropyDeviceConfig};
     use crate::vmm_config::net::{NetBuilder, NetworkInterfaceConfig};
     use crate::vmm_config::vsock::tests::default_config;
@@ -1144,6 +1196,7 @@ pub mod tests {
             vcpus_exit_evt,
             resource_allocator: ResourceAllocator::new().unwrap(),
             mmio_device_manager,
+            memory_device_guest_memory: Vec::new(),
             #[cfg(target_arch = "x86_64")]
             pio_device_manager,
             acpi_device_manager,
@@ -1285,6 +1338,25 @@ pub mod tests {
         assert!(vmm
             .mmio_device_manager
             .get_device(DeviceType::Virtio(TYPE_BALLOON), BALLOON_DEV_ID)
+            .is_some());
+    }
+
+    fn page_size() -> u64 {
+        get_page_size().unwrap() as u64
+    }
+    pub(crate) fn insert_memory_device(
+        vmm: &mut Vmm,
+        cmdline: &mut Cmdline,
+        event_manager: &mut EventManager,
+        memory_config: MemoryDeviceConfig,
+    ) {
+        let id = memory_config.id.clone();
+        let mut builder = MemoryBuilder::new();
+        assert!(builder.insert(memory_config).is_ok());
+        assert!(attach_memory_devices(vmm, cmdline, builder.iter(), event_manager).is_ok());
+        assert!(vmm
+            .mmio_device_manager
+            .get_device(DeviceType::Virtio(TYPE_MEMORY), id.as_str())
             .is_some());
     }
 
@@ -1602,6 +1674,29 @@ pub mod tests {
             &cmdline,
             "virtio_mmio.device=4K@0xd0000000:5"
         ));
+    }
+
+    #[test]
+    fn test_attach_memory_devices() {
+        let mut event_manager = EventManager::new().expect("Unable to create EventManager");
+        let mut vmm = default_vmm();
+        let memory_config = MemoryDeviceConfig {
+            block_size: page_size(),
+            id: String::from("mem-dev"),
+            node_id: 0,
+            region_size: 8 * page_size(),
+            requested_size: 0,
+        };
+        let mut cmdline = default_kernel_cmdline();
+        insert_memory_device(&mut vmm, &mut cmdline, &mut event_manager, memory_config);
+        // Check if the memory device is described in kernel_cmdline.
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        assert!(cmdline
+            .as_cstring()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("virtio_mmio.device=4K@0xd0000000:5"));
     }
 
     #[test]

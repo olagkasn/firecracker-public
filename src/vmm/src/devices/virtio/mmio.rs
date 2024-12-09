@@ -363,9 +363,10 @@ impl MmioTransport {
             }
             _ => {
                 warn!(
-                    "invalid virtio mmio write: 0x{:x}:0x{:x}",
+                    "invalid virtio mmio write: 0x{:x}:0x{:x} for device type [{}]",
                     offset,
-                    data.len()
+                    data.len(),
+                    self.device.lock().expect("Poisoned lock").device_type()
                 );
             }
         }

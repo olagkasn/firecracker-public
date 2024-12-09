@@ -127,6 +127,10 @@ pub struct Vm {
     // On aarch64 we need to keep around the fd obtained by creating the VGIC device.
     #[cfg(target_arch = "aarch64")]
     irqchip_handle: Option<GICDevice>,
+
+    // the next available slot to be used for adding a user memory region with
+    // KVM_SET_USER_MEMORY_REGION
+    next_memory_slot: u16,
 }
 
 /// Contains Vm functions that are usable across CPU architectures
@@ -157,6 +161,7 @@ impl Vm {
                 max_memslots,
                 kvm_cap_modifiers,
                 irqchip_handle: None,
+                next_memory_slot: 0,
             })
         }
 
@@ -170,6 +175,7 @@ impl Vm {
             Ok(Vm {
                 fd: vm_fd,
                 max_memslots,
+                next_memory_slot: 0,
                 kvm_cap_modifiers,
                 supported_cpuid,
                 msrs_to_save,
@@ -208,11 +214,11 @@ impl Vm {
 
     /// Initializes the guest memory.
     pub fn memory_init(
-        &self,
+        &mut self,
         guest_mem: &GuestMemoryMmap,
         track_dirty_pages: bool,
     ) -> Result<(), VmError> {
-        if guest_mem.num_regions() > self.max_memslots {
+        if guest_mem.num_regions() + self.next_memory_slot as usize > self.max_memslots {
             return Err(VmError::NotEnoughMemorySlots);
         }
         self.set_kvm_memory_regions(guest_mem, track_dirty_pages)?;
@@ -224,8 +230,15 @@ impl Vm {
         Ok(())
     }
 
+    /// Adds an additional guest_memory to the VM (needed for Virtio Memory Devices) by registering
+    /// it with KVM.
+    pub fn add_memory(&mut self, guest_mem: &GuestMemoryMmap) -> Result<(), VmError> {
+        self.set_kvm_memory_regions(guest_mem, false)?;
+        Ok(())
+    }
+
     pub(crate) fn set_kvm_memory_regions(
-        &self,
+        &mut self,
         guest_mem: &GuestMemoryMmap,
         track_dirty_pages: bool,
     ) -> Result<(), VmError> {
@@ -236,15 +249,21 @@ impl Vm {
         guest_mem
             .iter()
             .zip(0u32..)
-            .try_for_each(|(region, slot)| {
+            .try_for_each(|(region, _slot)| {
                 let memory_region = kvm_userspace_memory_region {
-                    slot,
+                    slot: self.next_memory_slot as u32,
                     guest_phys_addr: region.start_addr().raw_value(),
                     memory_size: region.len(),
                     // It's safe to unwrap because the guest address is valid.
                     userspace_addr: guest_mem.get_host_address(region.start_addr()).unwrap() as u64,
                     flags,
                 };
+
+                // This is needed because virtio memory devices introduce a new `GuestMemoryMmap`
+                // for each memory device. And each one of those starts numbering the regions
+                // from 0, but they each must be registered with KVM using unique
+                // slot numbers.
+                self.next_memory_slot += 1;
 
                 // SAFETY: Safe because the fd is a valid KVM file descriptor.
                 unsafe { self.fd.set_user_memory_region(memory_region) }
@@ -477,7 +496,7 @@ pub(crate) mod tests {
     pub(crate) fn setup_vm(mem_size: usize) -> (Vm, GuestMemoryMmap) {
         let gm = single_region_mem(mem_size);
 
-        let vm = Vm::new(vec![]).expect("Cannot create new vm");
+        let mut vm = Vm::new(vec![]).expect("Cannot create new vm");
         vm.memory_init(&gm, false).unwrap();
 
         (vm, gm)
@@ -509,7 +528,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_vm_memory_init() {
-        let vm = Vm::new(vec![]).expect("Cannot create new vm");
+        let  mut vm = Vm::new(vec![]).expect("Cannot create new vm");
 
         // Create valid memory region and test that the initialization is successful.
         let gm = single_region_mem(0x1000);
@@ -587,7 +606,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_set_kvm_memory_regions() {
-        let vm = Vm::new(vec![]).expect("Cannot create new vm");
+        let mut vm = Vm::new(vec![]).expect("Cannot create new vm");
 
         let gm = single_region_mem(0x1000);
         let res = vm.set_kvm_memory_regions(&gm, false);

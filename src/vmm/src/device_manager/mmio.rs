@@ -29,12 +29,13 @@ use crate::devices::legacy::RTCDevice;
 use crate::devices::pseudo::BootTimer;
 use crate::devices::virtio::balloon::Balloon;
 use crate::devices::virtio::block::device::Block;
+use crate::devices::virtio::memory::device::Memory;
 use crate::devices::virtio::device::VirtioDevice;
 use crate::devices::virtio::mmio::MmioTransport;
 use crate::devices::virtio::net::Net;
 use crate::devices::virtio::rng::Entropy;
 use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend, TYPE_VSOCK};
-use crate::devices::virtio::{TYPE_BALLOON, TYPE_BLOCK, TYPE_NET, TYPE_RNG};
+use crate::devices::virtio::{TYPE_BALLOON, TYPE_BLOCK, TYPE_NET, TYPE_RNG, TYPE_MEMORY};
 use crate::devices::BusDevice;
 #[cfg(target_arch = "x86_64")]
 use crate::vstate::memory::GuestAddress;
@@ -495,6 +496,16 @@ impl MMIODeviceManager {
                         if vsock.is_activated() {
                             info!("kick vsock {id}.");
                             vsock.signal_used_queue().unwrap();
+                        }
+                    }
+                    TYPE_MEMORY => {
+                        let memory = virtio.as_mut_any().downcast_mut::<Memory>().unwrap();
+                        if memory.is_activated() {
+                            info!("kick memory device {}.", id);
+                            // TODO: This should be memory device trying to process a posssible
+                            // initialization when the `plugged_size` > 0
+                            // (See virtio-1.2 Chapter 5.15.5).
+                            memory.process_guest_request_queue();
                         }
                     }
                     TYPE_RNG => {

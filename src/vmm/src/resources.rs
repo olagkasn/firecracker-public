@@ -24,6 +24,7 @@ use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{
     HugePageConfig, MachineConfig, MachineConfigUpdate, VmConfig, VmConfigError,
 };
+use crate::vmm_config::memory::{MemoryBuilder, MemoryConfigError, MemoryDeviceConfig};
 use crate::vmm_config::metrics::{init_metrics, MetricsConfig, MetricsConfigError};
 use crate::vmm_config::mmds::{MmdsConfig, MmdsConfigError};
 use crate::vmm_config::net::*;
@@ -46,6 +47,8 @@ pub enum ResourcesError {
     Logger(#[from] crate::logger::LoggerUpdateError),
     /// Metrics error: {0}
     Metrics(#[from] MetricsConfigError),
+    /// Memory device error:
+    MemoryDevice(#[from] MemoryConfigError),
     /// MMDS error: {0}
     Mmds(#[from] mmds::data_store::MmdsDatastoreError),
     /// MMDS config error: {0}
@@ -75,6 +78,8 @@ pub struct VmmConfig {
     logger: Option<crate::logger::LoggerConfig>,
     #[serde(rename = "machine-config")]
     machine_config: Option<MachineConfig>,
+    #[serde(rename = "memory-devices", default)]
+    memory_devices: Vec<MemoryDeviceConfig>,
     #[serde(rename = "metrics")]
     metrics: Option<MetricsConfig>,
     #[serde(rename = "mmds-config")]
@@ -101,6 +106,8 @@ pub struct VmResources {
     pub vsock: VsockBuilder,
     /// The balloon device.
     pub balloon: BalloonBuilder,
+    /// The memory device.
+    pub memory: MemoryBuilder,
     /// The network devices builder.
     pub net_builder: NetBuilder,
     /// The entropy device builder.
@@ -165,6 +172,10 @@ impl VmResources {
 
         if let Some(balloon_config) = vmm_config.balloon_device {
             resources.set_balloon_device(balloon_config)?;
+        }
+
+        for memory_config in vmm_config.memory_devices {
+            resources.set_memory_device(memory_config)?;
         }
 
         // Init the data store from file, if present.
@@ -347,6 +358,12 @@ impl VmResources {
         self.balloon.set(config)
     }
 
+    /// Sets a memory device to be attached when the VM starts.
+    pub fn set_memory_device(&mut self, config: MemoryDeviceConfig
+    ) -> Result<(), MemoryConfigError> {
+        self.memory.insert(config)
+    }
+
     /// Obtains the boot source hooks (kernel fd, command line creation and validation).
     pub fn build_boot_source(
         &mut self,
@@ -484,6 +501,7 @@ impl From<&VmResources> for VmmConfig {
             cpu_config: None,
             logger: None,
             machine_config: Some(MachineConfig::from(&resources.vm_config)),
+            memory_devices: Vec::new(), // TODO
             metrics: None,
             mmds_config: resources.mmds_config(),
             net_devices: resources.net_builder.configs(),
@@ -595,6 +613,7 @@ mod tests {
             balloon: Default::default(),
             net_builder: default_net_builder(),
             mmds: None,
+            memory: Default::default(),
             boot_timer: false,
             mmds_size_limit: HTTP_MAX_PAYLOAD_SIZE,
             entropy: Default::default(),

@@ -845,6 +845,7 @@ mod tests {
     "track_dirty_pages": false,
     "huge_pages": "None"
   }},
+  "memory-devices": [],
   "metrics": null,
   "mmds-config": {{
     "version": "V2",
