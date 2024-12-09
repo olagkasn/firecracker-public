@@ -13,7 +13,7 @@ use super::super::{ActivateError, TYPE_MEMORY};
 use crate::devices::virtio::device::DeviceState;
 use crate::devices::virtio::device::VirtioDevice;
 use crate::devices::virtio::queue::Queue;
-use super::QUEUE_SIZE;
+use super::{MemoryResult, QUEUE_SIZE};
 use crate::devices::virtio::memory::Error as MemoryError;
 use crate::devices::virtio::device::IrqTrigger;
 #[repr(C)]
@@ -53,14 +53,17 @@ impl Memory {
         node_id: Option<u16>,
         region_size: u64,
         id: String,
-    ) -> Result<Memory, MemoryError> {
+    ) -> MemoryResult<Memory> {
+        // the way thsi device will handle hot(un)plugs requires the block size
+        // to be a multiple of the host page size
+        //        
         // memory device is only available for 64 bit platforms
         let page_size: u64 = get_page_size().map_err(MemoryError::PageSize)? as u64;
         if block_size == 0 {
             return Err(MemoryError::BlockSizeIsZero);
         }
         if block_size % page_size != 0 {
-            return Err(MemoryError::BlockSizeNotAllignedToPage);
+            return Err(MemoryError::BlockSizeNotMultipleOfPageSize(page_size));
         }
         // virtio-mem spec requirement
         if !block_size.is_power_of_two() {
@@ -106,11 +109,12 @@ impl Memory {
         // TODO
         info!("Memory.process_guest_requests_queue");
     }
+    #[inline]
     fn addr_is_set(&self) -> bool {
         self.addr_is_set
     }
     /// Set the start address of the memory region managed by this device.
-    pub fn set_addr(&mut self, addr: u64) -> Result<(), MemoryError> {
+    pub fn set_addr(&mut self, addr: u64) -> MemoryResult<()> {
         if self.addr_is_set() {
             return Err(MemoryError::AddressAlreadySet);
         }
@@ -130,7 +134,7 @@ impl Memory {
         self.config_space.block_size
     }
     /// Handle
-    pub fn change_requested_size(&mut self, requested_size: u64) -> Result<(), MemoryError> {
+    pub fn change_requested_size(&mut self, requested_size: u64) -> MemoryResult<()> {
         // TODO
         info!(
             "Got a request to change the requested_size of memory device [{}] to [{}] bytes",
@@ -199,17 +203,19 @@ impl VirtioDevice for Memory {
         self.device_state.is_activated()
     }
     fn activate(&mut self, mem: GuestMemoryMmap) -> Result<(), ActivateError> {
-        self.device_state = DeviceState::Activated(mem);
         if self.activate_evt.write(1).is_err() {
             error!("Memory: Cannot write to activate_evt");
             // TODO: Increment metrics (?)
             self.device_state = DeviceState::Inactive;
             return Err(ActivateError::EventFd);
         }
+        self.device_state = DeviceState::Activated(mem);
+
         info!("Memory device [{}] got activated!", self.id());
         Ok(())
     }
 }
+
 #[cfg(test)]
 pub(crate) mod tests {
     use utils::{byte_order, get_page_size};
@@ -225,9 +231,14 @@ pub(crate) mod tests {
             self.queues[idx] = q;
         }
     }
+    
+    fn page_size() -> u64 {
+        get_page_size().unwrap() as u64
+    }
+
     #[test]
     fn test_new_memory() {
-        let page_size: u64 = get_page_size().unwrap() as u64;
+        let page_size: u64 = page_size();
         let block_size_zero = Memory::new(0, None, 0, String::from("memory-dev-1"));
         match block_size_zero {
             Err(MemoryError::BlockSizeIsZero) => {}
@@ -236,7 +247,7 @@ pub(crate) mod tests {
         let block_size_allignment =
             Memory::new(page_size + 1, None, 0, String::from("memory-dev-2"));
         match block_size_allignment {
-            Err(MemoryError::BlockSizeNotAllignedToPage) => {}
+            Err(MemoryError::BlockSizeNotMultipleOfPageSize(_)) => {}
             _ => unreachable!(),
         }
         let block_size_power2 = Memory::new(page_size * 3, None, 0, String::from("memory-dev-3"));

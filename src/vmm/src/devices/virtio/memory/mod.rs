@@ -18,8 +18,8 @@ pub enum Error {
     AddressAlreadySet,
     /// Block Size is zero bytes.
     BlockSizeIsZero,
-    /// Block Size not alligned to page size.
-    BlockSizeNotAllignedToPage,
+    /// Block Size not a multiple of page size.
+    BlockSizeNotMultipleOfPageSize(u64),
     /// Block Size not a power of 2.
     BlockSizeNotPowerOf2,
     /// Device not activated yet.
@@ -33,3 +33,5 @@ pub enum Error {
     /// Size is not a multiple of Block Size.
     SizeNotMultipleOfBlockSize,
 }
+
+pub type MemoryResult<T> = std::result::Result<T, Error>;

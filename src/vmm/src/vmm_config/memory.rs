@@ -3,6 +3,9 @@
 use std::sync::{Arc, Mutex};
 use crate::devices::virtio::memory::device::Memory;
 use serde::{Deserialize, Serialize};
+
+const KIB: u64 = 1024;
+
 type MutexMemory = Arc<Mutex<Memory>>;
 /// Errors associated with the operations allowed on the memory.
 
@@ -28,15 +31,15 @@ pub struct MemoryDeviceConfig {
     pub id: String,
     /// Block size in bytes.
     #[serde(default)]
-    pub block_size: u64,
+    pub block_size_kib: u64,
     /// Node id if any.
     #[serde(default)]
-    pub node_id: u16,
+    pub node_id: Option<u16>,
     /// Region size in bytes.
-    pub region_size: u64,
+    pub region_size_kib: u64,
     /// Requested size in bytes.
     #[serde(default)]
-    pub requested_size: u64,
+    pub requested_size_kib: u64,
 }
 /// The data fed into a memory update request. The only thing that can be modified
 /// is the requested size of the memory region.
@@ -44,7 +47,7 @@ pub struct MemoryDeviceConfig {
 #[serde(deny_unknown_fields)]
 pub struct MemoryUpdateConfig {
     /// Requested size in bytes.
-    pub requested_size: u64,
+    pub requested_size_kib: u64,
 }
 /// A builder for `Memory` devices from 'MemoryDeviceConfig'.
 #[derive(Debug)]
@@ -67,13 +70,9 @@ impl MemoryBuilder {
     /// Creates a Memory device from the MemoryDeviceConfig provided
     fn build(cfg: MemoryDeviceConfig) -> Result<MutexMemory> {
         let memory = Memory::new(
-            cfg.block_size,
-            if cfg.node_id != 0 {
-                Some(cfg.node_id)
-            } else {
-                None
-            },
-            cfg.region_size,
+            cfg.block_size_kib * KIB,
+            cfg.node_id,
+            cfg.region_size_kib * KIB,
             cfg.id,
         )
         .map_err(MemoryConfigError::CreateFailure)?;
@@ -110,25 +109,25 @@ impl MemoryBuilder {
 pub(crate) mod tests {
     use utils::get_page_size;
     use super::*;
-    fn page_size() -> u64 {
-        get_page_size().unwrap() as u64
+    fn page_size_kib() -> u64 {
+        get_page_size().unwrap() as u64 / KIB
     }
     fn default_config() -> MemoryDeviceConfig {
         MemoryDeviceConfig {
             id: String::from("memory-dev"),
-            block_size: page_size(),
-            node_id: 0,
-            region_size: 8 * page_size(),
-            requested_size: 0,
+            block_size_kib: 4 * page_size_kib(),
+            node_id: None,
+            region_size_kib: 8 * 4 * page_size_kib(),
+            requested_size_kib: 0,
         }
     }
     fn broken_config() -> MemoryDeviceConfig {
         MemoryDeviceConfig {
             id: String::from("broken-config"),
-            block_size: page_size() + 1,
-            node_id: 0,
-            region_size: page_size() + 2,
-            requested_size: 0,
+            block_size_kib: 0,
+            node_id: None,
+            region_size_kib: 8 * 4 * page_size_kib(),
+            requested_size_kib: 0,
         }
     }
     #[test]
@@ -145,7 +144,7 @@ pub(crate) mod tests {
     #[test]
     fn test_insert_broken_config() {
         let mut memory_builder = MemoryBuilder::new();
-        // trying to build a memory device from o ill-formed config
+        // trying to build a memory device from an ill-formed config
         match memory_builder.insert(broken_config()) {
             Err(MemoryConfigError::CreateFailure(_)) => {}
             _ => unreachable!(),
