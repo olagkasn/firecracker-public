@@ -1,6 +1,5 @@
 // Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
-use std::fmt;
 use std::sync::{Arc, Mutex};
 use crate::devices::virtio::memory::device::Memory;
 use serde::{Deserialize, Serialize};

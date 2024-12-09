@@ -3,8 +3,6 @@
 use std::cmp;
 use std::io::Write;
 use std::result::Result;
-use std::sync::atomic::AtomicUsize;
-use std::sync::Arc;
 use crate::logger::{error, info};
 use utils::eventfd::EventFd;
 use utils::get_page_size;

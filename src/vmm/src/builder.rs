@@ -6,7 +6,8 @@
 #[cfg(target_arch = "x86_64")]
 use std::convert::TryFrom;
 use std::fmt::Debug;
-use std::io::{self, Seek, SeekFrom};
+use std::io::{self, Error, Seek, SeekFrom};
+use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 
 use event_manager::{MutEventSubscriber, SubscriberOps};
@@ -22,7 +23,9 @@ use userfaultfd::Uffd;
 use utils::eventfd::EventFd;
 use utils::time::TimestampUs;
 use utils::u64_to_usize;
-use vm_memory::ReadVolatile;
+use vm_memory::bitmap::AtomicBitmap;
+use vm_memory::mmap::{check_file_offset, MmapRegionBuilder, MmapRegionError, NewBitmap};
+use vm_memory::{FileOffset, GuestRegionMmap, ReadVolatile};
 #[cfg(target_arch = "aarch64")]
 use vm_superio::Rtc;
 use vm_superio::Serial;
@@ -65,7 +68,7 @@ use crate::snapshot::Persist;
 use crate::vmm_config::boot_source::BootConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{VmConfig, VmConfigError};
-use crate::vstate::memory::{GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryMmap};
+use crate::vstate::memory::{GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMmapRegion, MemoryError};
 use crate::vstate::vcpu::{Vcpu, VcpuConfig, VcpuError};
 use crate::vstate::vm;
 use crate::vstate::vm::Vm;
@@ -96,7 +99,7 @@ pub enum StartMicrovmError {
     /// Error creating VMGenID device: {0}
     CreateVMGenID(VmGenIdError),
     /// Invalid Memory Configuration: {0}
-    GuestMemory(crate::vstate::memory::MemoryError),
+    GuestMemory(#[from] crate::vstate::memory::MemoryError),
     /// Cannot load initrd due to an invalid memory configuration.
     InitrdLoad,
     /// Cannot load initrd due to an invalid image: {0}
@@ -112,7 +115,7 @@ pub enum StartMicrovmError {
     /// Cannot load command line string: {0}
     LoadCommandline(linux_loader::loader::Error),
     /// Cannot add region for a memory device: {0}
-    MemoryDevice(crate::devices::virtio::memory::Error),
+    MemoryDevice(#[from] crate::devices::virtio::memory::Error),
     /// Cannot start microvm without kernel configuration.
     MissingKernelConfig,
     /// Cannot start microvm without guest mem_size config.
@@ -1019,12 +1022,111 @@ fn attach_balloon_device(
     attach_virtio_device(event_manager, vmm, id, balloon.clone(), cmdline, false)
 }
 
+const GUARD_PAGE_COUNT: usize = 1;
+
+fn build_guarded_region(
+    maybe_file_offset: Option<FileOffset>,
+    size: usize,
+    prot: i32,
+    flags: i32,
+    track_dirty_pages: bool,
+) -> Result<GuestMmapRegion, MmapRegionError> {
+    let page_size = utils::get_page_size().expect("Cannot retrieve page size.");
+    // Create the guarded range size (received size + X pages),
+    // where X is defined as a constant GUARD_PAGE_COUNT.
+    let guarded_size = size + GUARD_PAGE_COUNT * 2 * page_size;
+
+    // Map the guarded range to PROT_NONE
+    let guard_addr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            guarded_size,
+            libc::PROT_NONE,
+            libc::MAP_ANONYMOUS | libc::MAP_PRIVATE | libc::MAP_NORESERVE,
+            -1,
+            0,
+        )
+    };
+
+    if guard_addr == libc::MAP_FAILED {
+        return Err(MmapRegionError::Mmap(Error::last_os_error()));
+    }
+
+    let (fd, offset) = match maybe_file_offset {
+        Some(ref file_offset) => {
+            check_file_offset(file_offset, size)?;
+            (file_offset.file().as_raw_fd(), file_offset.start())
+        }
+        None => (-1, 0),
+    };
+
+    let region_start_addr = guard_addr as usize + page_size * GUARD_PAGE_COUNT;
+
+    // Inside the protected range, starting with guard_addr + PAGE_SIZE,
+    // map the requested range with received protection and flags
+    let region_addr = unsafe {
+        libc::mmap(
+            region_start_addr as *mut libc::c_void,
+            size,
+            prot,
+            flags | libc::MAP_FIXED,
+            fd,
+            offset as libc::off_t,
+        )
+    };
+
+    if region_addr == libc::MAP_FAILED {
+        return Err(MmapRegionError::Mmap(Error::last_os_error()));
+    }
+
+    let bitmap = match track_dirty_pages {  
+        true => Some(AtomicBitmap::with_len(size)),
+        false => None,
+    };
+
+    unsafe {
+        MmapRegionBuilder::new_with_bitmap(size, bitmap)
+            .with_raw_mmap_pointer(region_addr as *mut u8)
+            .with_mmap_prot(prot)
+            .with_mmap_flags(flags)
+            .build()
+    }
+}
+
+/// Helper for creating the guest memory.
+pub fn create_guest_memory(
+    regions: &[(Option<FileOffset>, GuestAddress, usize)],
+    track_dirty_pages: bool,
+) -> std::result::Result<GuestMemoryMmap, MemoryError> {
+    let prot = libc::PROT_READ | libc::PROT_WRITE;
+    let mut mmap_regions = Vec::with_capacity(regions.len());
+
+    for region in regions {
+        let flags = match region.0 {
+            None => libc::MAP_NORESERVE | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            Some(_) => libc::MAP_NORESERVE | libc::MAP_PRIVATE,
+        };
+
+        let mmap_region =
+            build_guarded_region(region.0.clone(), region.2, prot, flags, track_dirty_pages)
+                .map_err(MemoryError::MmapRegionError)?;
+
+        let guest_region = GuestRegionMmap::new(mmap_region, region.1)
+            .map_err(MemoryError::VmMemoryError)?;
+        mmap_regions.push(guest_region);
+    }
+
+    GuestMemoryMmap::from_regions(mmap_regions)
+        .map_err(MemoryError::VmMemoryError)
+}
+
 fn attach_memory_devices<'a>(
     vmm: &mut Vmm,
     cmdline: &mut LoaderKernelCmdline,
     memory_devices: impl Iterator<Item = &'a Arc<Mutex<Memory>>>,
     event_manager: &mut EventManager,
-) -> std::result::Result<(), StartMicrovmError> {
+) -> Result<(), StartMicrovmError> {
+
     for (index, memory) in memory_devices.enumerate() {
         if index > 0 {
             panic!("too many memory devices. please only use one for now!! Thx >.< !!")
@@ -1036,9 +1138,14 @@ fn attach_memory_devices<'a>(
         // For now, when developing/testing with only one memory device, this hardcoded address
         // should suffice.
         let region_start_address = 32 * GIB;
+        
         // Creating the actual memory backend for this memory device.
-        let this_device_memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(region_start_address), size)])
-            .map_err(StartMicrovmError::GuestMemory)?;
+        let this_device_memory = create_guest_memory(
+            &[(None, GuestAddress(region_start_address), size)],
+            false,
+        )
+        .map_err(StartMicrovmError::GuestMemory)?;
+
         // Adding the memory to the VM.
         vmm.vm
             .add_memory(&this_device_memory)
